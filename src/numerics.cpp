@@ -132,10 +132,10 @@ ControlStatus expm(ArrayRef<f64> a_in, usize n, MutArrayRef<f64> out, Allocator*
     i32 s = 0;
     if (norm_a > 0.5) {
         const f64 l2 = keel::log2(norm_a / 0.5);
-        s = static_cast<i32>(keel::ceil(keel::max(l2, 0.0)));
+        s = as<i32>(keel::ceil(keel::max(l2, 0.0)));
     }
     if (s > 0) {
-        const f64 scale = keel::pow(0.5, static_cast<f64>(s));
+        const f64 scale = keel::pow(0.5, as<f64>(s));
         for (usize i = 0; i < n2; ++i) a[i] *= scale;
     }
 
@@ -188,7 +188,7 @@ ControlStatus expm(ArrayRef<f64> a_in, usize n, MutArrayRef<f64> out, Allocator*
         }
         for (i32 k = 1; k < 30; ++k) {
             (void)matmul(term, n, n, a, n, next_term);
-            const f64 inv = 1.0 / static_cast<f64>(k);
+            const f64 inv = 1.0 / as<f64>(k);
             for (usize i = 0; i < n2; ++i) {
                 term[i] = next_term[i] * inv;
                 e[i] += term[i];
@@ -225,7 +225,7 @@ ControlStatus char_poly(ArrayRef<f64> a, usize n, MutArrayRef<f64> out, Allocato
         (void)matmul(a, n, n, m, n, am);
         f64 tr = 0.0;
         for (usize i = 0; i < n; ++i) tr += am[i * n + i];
-        const f64 ck = -tr / static_cast<f64>(k);
+        const f64 ck = -tr / as<f64>(k);
         out[k] = ck;
         for (usize i = 0; i < n; ++i) am[i * n + i] += ck;
         keel::swap(m, am);
