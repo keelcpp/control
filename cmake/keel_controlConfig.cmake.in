@@ -2,7 +2,13 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(keel)
+find_dependency(keel_poly)
+find_dependency(keel_linalg)
 
 include("${CMAKE_CURRENT_LIST_DIR}/keel_controlTargets.cmake")
+
+if(TARGET keel::keel_control AND NOT TARGET keel::control)
+    add_library(keel::control ALIAS keel::keel_control)
+endif()
 
 check_required_components(keel_control)

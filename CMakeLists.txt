@@ -18,9 +18,55 @@ if(NOT TARGET keel::keel)
     FetchContent_Declare(
         keel
         GIT_REPOSITORY https://github.com/keelcpp/keel.git
-        GIT_TAG        b905b095c1b30d5162794c160b2841544a4a4e12
+        GIT_TAG        869a5c07a5d77341e5f6acbac5f8e024b274ea08
     )
     FetchContent_MakeAvailable(keel)
+endif()
+
+if(NOT TARGET keel::poly)
+    find_package(keel_poly QUIET CONFIG)
+    if(TARGET keel::keel_poly AND NOT TARGET keel::poly)
+        add_library(keel::poly ALIAS keel::keel_poly)
+    endif()
+endif()
+if(NOT TARGET keel::poly)
+    include(FetchContent)
+    set(KEEL_POLY_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../poly/CMakeLists.txt" AND NOT DEFINED FETCHCONTENT_SOURCE_DIR_KEEL_POLY)
+        set(FETCHCONTENT_SOURCE_DIR_KEEL_POLY "${CMAKE_CURRENT_SOURCE_DIR}/../poly" CACHE PATH "Local keel_poly checkout")
+    endif()
+    if(KEEL_CONTROL_NO_EXCEPTIONS_RTTI)
+        set(KEEL_POLY_NO_EXCEPTIONS_RTTI ON CACHE BOOL "" FORCE)
+    endif()
+    FetchContent_Declare(
+        keel_poly
+        GIT_REPOSITORY https://github.com/keelcpp/poly.git
+        GIT_TAG        87429cfe8d8a3353b24ffdfa7385baba42c049ee
+    )
+    FetchContent_MakeAvailable(keel_poly)
+endif()
+
+if(NOT TARGET keel::linalg)
+    find_package(keel_linalg QUIET CONFIG)
+    if(TARGET keel::keel_linalg AND NOT TARGET keel::linalg)
+        add_library(keel::linalg ALIAS keel::keel_linalg)
+    endif()
+endif()
+if(NOT TARGET keel::linalg)
+    include(FetchContent)
+    set(KEEL_LINALG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../linalg/CMakeLists.txt" AND NOT DEFINED FETCHCONTENT_SOURCE_DIR_KEEL_LINALG)
+        set(FETCHCONTENT_SOURCE_DIR_KEEL_LINALG "${CMAKE_CURRENT_SOURCE_DIR}/../linalg" CACHE PATH "Local keel_linalg checkout")
+    endif()
+    if(KEEL_CONTROL_NO_EXCEPTIONS_RTTI)
+        set(KEEL_LINALG_NO_EXCEPTIONS_RTTI ON CACHE BOOL "" FORCE)
+    endif()
+    FetchContent_Declare(
+        keel_linalg
+        GIT_REPOSITORY https://github.com/keelcpp/linalg.git
+        GIT_TAG        bfbb5449d06dae36a3bafe8f80700082d8201b01
+    )
+    FetchContent_MakeAvailable(keel_linalg)
 endif()
 
 add_library(keel_control STATIC
@@ -28,10 +74,19 @@ add_library(keel_control STATIC
     src/lyapunov.cpp
     src/riccati.cpp
     src/place.cpp
+    src/state.cpp
+    src/conversion.cpp
+    src/discretize.cpp
+    src/response.cpp
+    src/freq.cpp
+    src/hinfnorm.cpp
 )
 add_library(keel::control ALIAS keel_control)
 
-target_link_libraries(keel_control PUBLIC keel::keel)
+target_link_libraries(keel_control
+    PUBLIC  keel::keel
+    PRIVATE keel::poly keel::linalg
+)
 
 target_compile_features(keel_control PUBLIC cxx_std_20)
 set_target_properties(keel_control PROPERTIES
@@ -65,6 +120,7 @@ if(COMMAND keel_enforce_guidelines)
     keel_enforce_guidelines(keel_control
         SCOPE ALL
         BAN_RAW_INTS ALL
+        BAN_RAW_FLOATS ALL
         HEADERS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include"
         STANDALONE_HEADERS ${KEEL_CONTROL_BUILD_TESTS}
         TEST_NAME test_guidelines_headers
