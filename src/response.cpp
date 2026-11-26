@@ -1,5 +1,6 @@
 #include "keel/control.h"
 
+#include "keel/arena.h"
 #include "keel/array.h"
 #include "keel/math.h"
 
@@ -10,10 +11,21 @@ namespace {
 bool is_uniform_grid(ArrayRef<f64> t, f64& dt_out) noexcept {
     const usize n = t.size();
     dt_out = (n >= 2) ? (t[1] - t[0]) : 0.0;
+    if (!keel::is_finite(dt_out)) return false;
     for (usize k = 2; k < n; ++k) {
-        if (keel::abs((t[k] - t[k - 1]) - dt_out) > 1e-12 * keel::max(1.0, keel::abs(dt_out))) {
+        const f64 dk = t[k] - t[k - 1];
+        if (!keel::is_finite(dk) ||
+            keel::abs(dk - dt_out) > 1e-12 * keel::max(1.0, keel::abs(dt_out))) {
             return false;
         }
+    }
+    return true;
+}
+
+bool is_strictly_increasing_finite(ArrayRef<f64> t) noexcept {
+    for (usize k = 0; k < t.size(); ++k) {
+        if (!keel::is_finite(t[k])) return false;
+        if (k > 0 && !(t[k] > t[k - 1])) return false;
     }
     return true;
 }
@@ -21,8 +33,18 @@ bool is_uniform_grid(ArrayRef<f64> t, f64& dt_out) noexcept {
 ControlStatus foh_mimo_step(ArrayRef<f64> a, ArrayRef<f64> b, usize n, usize nu, f64 dt,
                             MutArrayRef<f64> ad, MutArrayRef<f64> b0, MutArrayRef<f64> b1,
                             Allocator* alloc) {
+    if (!keel::is_finite(dt) || !(dt > 0.0)) {
+        return ControlStatus::kInvalidArgument;
+    }
+    if (nu > Limits<usize>::kMax / 2u || n > Limits<usize>::kMax - 2u * nu) {
+        return ControlStatus::kInvalidArgument;
+    }
     const usize aug = n + 2 * nu;
-    Array<f64> m(aug * aug, 0.0, alloc);
+    if (aug > Limits<usize>::kMax / aug) {
+        return ControlStatus::kInvalidArgument;
+    }
+    ArenaTemp scratch = keel::get_scratch(alloc);
+    Array<f64> m(aug * aug, 0.0, scratch.allocator());
     for (usize j = 0; j < n; ++j) {
         for (usize i = 0; i < n; ++i) {
             m[j * aug + i] = a[j * n + i] * dt;
@@ -34,8 +56,8 @@ ControlStatus foh_mimo_step(ArrayRef<f64> a, ArrayRef<f64> b, usize n, usize nu,
         }
         m[(n + nu + j) * aug + (n + j)] = 1.0;
     }
-    Array<f64> e(aug * aug, 0.0, alloc);
-    const ControlStatus st = expm(m.as_ref(), aug, e.as_mut_ref(), alloc);
+    Array<f64> e(aug * aug, 0.0, scratch.allocator());
+    const ControlStatus st = expm(m.as_ref(), aug, e.as_mut_ref(), scratch.allocator());
     if (st != ControlStatus::kOk) {
         return st;
     }
@@ -59,12 +81,18 @@ ControlStatus foh_mimo_step(ArrayRef<f64> a, ArrayRef<f64> b, usize n, usize nu,
 
 ControlStatus pick_time_grid(ArrayRef<c64> poles, f64 t_final_override, Array<f64>& t_out,
                              Allocator* alloc) {
+    if (!keel::is_finite(t_final_override) || t_final_override < 0.0) {
+        return ControlStatus::kInvalidArgument;
+    }
     f64 min_abs_real = 1.0;
     f64 max_abs_real = 1.0;
     if (!poles.empty()) {
         bool any_stable = false;
         for (usize i = 0; i < poles.size(); ++i) {
             const c64 p = poles[i];
+            if (!keel::is_finite(p.real()) || !keel::is_finite(p.imag())) {
+                continue;
+            }
             const f64 ar = keel::abs(p.real());
             const f64 mag = keel::abs(p);
             if (p.real() < 0.0 && mag > 0.0) {
@@ -84,7 +112,8 @@ ControlStatus pick_time_grid(ArrayRef<c64> poles, f64 t_final_override, Array<f6
 
     const f64 t_final_default = 5.80251 / min_abs_real;
     const f64 dt_raw = keel::min(t_final_default / 126.0, 1.0 / (4.0 * max_abs_real));
-    usize n_def = as<usize>(keel::ceil(t_final_default / dt_raw)) + 1;
+    const f64 ratio_def = t_final_default / dt_raw;
+    usize n_def = (ratio_def > 1000.0) ? 1000u : (as<usize>(keel::ceil(ratio_def)) + 1u);
     if (n_def < 60) {
         n_def = 60;
     }
@@ -94,7 +123,11 @@ ControlStatus pick_time_grid(ArrayRef<c64> poles, f64 t_final_override, Array<f6
     const f64 dt_final = t_final_default / as<f64>(n_def - 1);
 
     if (t_final_override > 0.0) {
-        const usize n = as<usize>(keel::ceil(t_final_override / dt_final)) + 1;
+        const f64 ratio = t_final_override / dt_final;
+        if (!keel::is_finite(ratio) || ratio > 1e7) {
+            return ControlStatus::kInvalidArgument;
+        }
+        const usize n = as<usize>(keel::ceil(ratio)) + 1;
         t_out = Array<f64>(n, 0.0, alloc);
         for (usize i = 0; i < n; ++i) {
             t_out[i] = as<f64>(i) * dt_final;
@@ -113,20 +146,25 @@ ControlStatus simulate_siso(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> c, f
                             f64 ts, ArrayRef<f64> t, ArrayRef<f64> u, ArrayRef<f64> x0,
                             MutArrayRef<f64> y_out, MutArrayRef<f64> x_traj_out, Allocator* alloc) {
     const usize n_steps = t.size();
-    if (a.size() < n * n || b.size() < n || c.size() < n || u.size() < n_steps ||
-        y_out.size() < n_steps) {
+    if (!keel::is_finite(ts) || !keel::is_finite(d) || (n > 0 && a.size() / n < n) ||
+        b.size() < n || c.size() < n || u.size() < n_steps || y_out.size() < n_steps) {
         return ControlStatus::kInvalidArgument;
     }
     if (!x0.empty() && x0.size() < n) {
         return ControlStatus::kInvalidArgument;
     }
     const bool want_traj = !x_traj_out.empty();
-    if (want_traj && x_traj_out.size() < n_steps * n) {
+    if (want_traj && n > 0 && x_traj_out.size() / n < n_steps) {
+        return ControlStatus::kInvalidArgument;
+    }
+    if (ts <= 0.0 && n_steps >= 2 && !is_strictly_increasing_finite(t)) {
         return ControlStatus::kInvalidArgument;
     }
 
-    Array<f64> x(n, 0.0, alloc);
-    Array<f64> xn(n, 0.0, alloc);
+    ArenaTemp scratch = keel::get_scratch(alloc);
+    Allocator* sa = scratch.allocator();
+    Array<f64> x(n, 0.0, sa);
+    Array<f64> xn(n, 0.0, sa);
     if (!x0.empty()) {
         for (usize i = 0; i < n; ++i) {
             x[i] = x0[i];
@@ -163,11 +201,11 @@ ControlStatus simulate_siso(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> c, f
 
     f64 dt = 0.0;
     const bool uniform = is_uniform_grid(t, dt);
-    Array<f64> ad(n * n, 0.0, alloc);
-    Array<f64> bd(n, 0.0, alloc);
+    Array<f64> ad(n * n, 0.0, sa);
+    Array<f64> bd(n, 0.0, sa);
 
     if (uniform && dt > 0.0) {
-        const ControlStatus st = c2d_zoh(a, b, n, 1, dt, ad.as_mut_ref(), bd.as_mut_ref(), alloc);
+        const ControlStatus st = c2d_zoh(a, b, n, 1, dt, ad.as_mut_ref(), bd.as_mut_ref(), sa);
         if (st != ControlStatus::kOk) {
             return st;
         }
@@ -203,7 +241,7 @@ ControlStatus simulate_siso(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> c, f
         if (k + 1 < n_steps) {
             const f64 dtk = t[k + 1] - t[k];
             const ControlStatus st =
-                c2d_zoh(a, b, n, 1, dtk, ad.as_mut_ref(), bd.as_mut_ref(), alloc);
+                c2d_zoh(a, b, n, 1, dtk, ad.as_mut_ref(), bd.as_mut_ref(), sa);
             if (st != ControlStatus::kOk) {
                 return st;
             }
@@ -225,23 +263,29 @@ ControlStatus simulate_mimo(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> c, A
                             ArrayRef<f64> u_colmajor, ArrayRef<f64> x0, MutArrayRef<f64> y_out,
                             MutArrayRef<f64> x_traj_out, Allocator* alloc) {
     const usize n_steps = t.size();
-    if (a.size() < n * n || b.size() < n * nu || c.size() < ny * n ||
-        u_colmajor.size() < n_steps * nu || y_out.size() < n_steps * ny) {
+    if (!keel::is_finite(ts) || (n > 0 && a.size() / n < n) || (n > 0 && nu > 0 && b.size() / nu < n) ||
+        (n > 0 && ny > 0 && c.size() / n < ny) || (nu > 0 && u_colmajor.size() / nu < n_steps) ||
+        (ny > 0 && y_out.size() / ny < n_steps)) {
         return ControlStatus::kInvalidArgument;
     }
-    if (!d.empty() && d.size() != 1 && d.size() < ny * nu) {
+    if (!d.empty() && d.size() != 1 && (nu > 0 && d.size() / nu < ny)) {
         return ControlStatus::kInvalidArgument;
     }
     if (!x0.empty() && x0.size() < n) {
         return ControlStatus::kInvalidArgument;
     }
     const bool want_traj = !x_traj_out.empty();
-    if (want_traj && x_traj_out.size() < n_steps * n) {
+    if (want_traj && n > 0 && x_traj_out.size() / n < n_steps) {
+        return ControlStatus::kInvalidArgument;
+    }
+    if (ts <= 0.0 && n_steps >= 2 && !is_strictly_increasing_finite(t)) {
         return ControlStatus::kInvalidArgument;
     }
 
-    Array<f64> x(n, 0.0, alloc);
-    Array<f64> xn(n, 0.0, alloc);
+    ArenaTemp scratch = keel::get_scratch(alloc);
+    Allocator* sa = scratch.allocator();
+    Array<f64> x(n, 0.0, sa);
+    Array<f64> xn(n, 0.0, sa);
     if (!x0.empty()) {
         for (usize i = 0; i < n; ++i) {
             x[i] = x0[i];
@@ -250,12 +294,12 @@ ControlStatus simulate_mimo(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> c, A
 
     f64 dt = 0.0;
     const bool uniform = is_uniform_grid(t, dt);
-    Array<f64> ad(n * n, 0.0, alloc);
-    Array<f64> b0(n * nu, 0.0, alloc);
-    Array<f64> b1(n * nu, 0.0, alloc);
+    Array<f64> ad(n * n, 0.0, sa);
+    Array<f64> b0(n * nu, 0.0, sa);
+    Array<f64> b1(n * nu, 0.0, sa);
     if (ts <= 0.0 && uniform && dt > 0.0 && n > 0) {
         const ControlStatus st =
-            foh_mimo_step(a, b, n, nu, dt, ad.as_mut_ref(), b0.as_mut_ref(), b1.as_mut_ref(), alloc);
+            foh_mimo_step(a, b, n, nu, dt, ad.as_mut_ref(), b0.as_mut_ref(), b1.as_mut_ref(), sa);
         if (st != ControlStatus::kOk) {
             return st;
         }
@@ -300,7 +344,7 @@ ControlStatus simulate_mimo(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> c, A
                 if (!uniform) {
                     const ControlStatus st =
                         foh_mimo_step(a, b, n, nu, t[k + 1] - t[k], ad.as_mut_ref(),
-                                      b0.as_mut_ref(), b1.as_mut_ref(), alloc);
+                                      b0.as_mut_ref(), b1.as_mut_ref(), sa);
                     if (st != ControlStatus::kOk) {
                         return st;
                     }
@@ -327,6 +371,11 @@ ControlStatus step_info(ArrayRef<f64> t, ArrayRef<f64> y, StepInfo& out) noexcep
     const usize n = t.size();
     if (n < 2 || y.size() < n) {
         return ControlStatus::kInvalidArgument;
+    }
+    for (usize i = 0; i < n; ++i) {
+        if (!keel::is_finite(t[i]) || !keel::is_finite(y[i])) {
+            return ControlStatus::kInvalidArgument;
+        }
     }
 
     const f64 yfinal = y[n - 1];
@@ -358,10 +407,13 @@ ControlStatus step_info(ArrayRef<f64> t, ArrayRef<f64> y, StepInfo& out) noexcep
         undershoot = keel::max(0.0, 100.0 * (-min_y) / yfinal);
     } else if (yfinal < 0.0) {
         f64 min_y = y[0];
+        f64 max_y = 0.0;
         for (usize i = 0; i < n; ++i) {
             if (y[i] < min_y) min_y = y[i];
+            if (y[i] > max_y) max_y = y[i];
         }
         overshoot = keel::max(0.0, 100.0 * (min_y - yfinal) / yfinal);
+        undershoot = keel::max(0.0, 100.0 * max_y / (-yfinal));
     }
 
     // Rise time: 10% -> 90% of yfinal.
@@ -375,13 +427,25 @@ ControlStatus step_info(ArrayRef<f64> t, ArrayRef<f64> y, StepInfo& out) noexcep
         for (usize i = 1; i < n; ++i) {
             const f64 a = y[i - 1] - y10;
             const f64 b = y[i] - y10;
-            if ((a < 0.0) != (b < 0.0) && keel::is_nan(t10)) {
-                const f64 frac = a / (a - b);
-                t10 = t[i - 1] + frac * (t[i] - t[i - 1]);
+            if (keel::is_nan(t10)) {
+                if (a == 0.0) {
+                    t10 = t[i - 1];
+                } else if (b == 0.0) {
+                    t10 = t[i];
+                } else if ((a < 0.0) != (b < 0.0)) {
+                    const f64 frac = a / (a - b);
+                    t10 = t[i - 1] + frac * (t[i] - t[i - 1]);
+                }
             }
             const f64 a9 = y[i - 1] - y90;
             const f64 b9 = y[i] - y90;
-            if ((a9 < 0.0) != (b9 < 0.0)) {
+            if (a9 == 0.0) {
+                t90 = t[i - 1];
+                if (!keel::is_nan(t10)) break;
+            } else if (b9 == 0.0) {
+                t90 = t[i];
+                if (!keel::is_nan(t10)) break;
+            } else if ((a9 < 0.0) != (b9 < 0.0)) {
                 const f64 frac = a9 / (a9 - b9);
                 t90 = t[i - 1] + frac * (t[i] - t[i - 1]);
                 if (!keel::is_nan(t10)) {

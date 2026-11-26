@@ -1,5 +1,6 @@
 #include "keel/control.h"
 
+#include "keel/arena.h"
 #include "keel/array.h"
 #include "keel/math.h"
 #include "keel/poly.h"
@@ -110,13 +111,18 @@ ArrayRef<f64> strip_leading(ArrayRef<f64> v) noexcept {
 ControlStatus damp(ArrayRef<c64> poles, f64 ts, MutArrayRef<f64> wn_out,
                    MutArrayRef<f64> zeta_out) noexcept {
     const usize n = poles.size();
-    if (wn_out.size() < n || zeta_out.size() < n) {
+    if (!keel::is_finite(ts) || wn_out.size() < n || zeta_out.size() < n) {
         return ControlStatus::kInvalidArgument;
     }
     const bool discrete = (ts > 0.0);
     for (usize i = 0; i < n; ++i) {
         c64 s = poles[i];
         if (discrete) {
+            if (s.real() == 0.0 && s.imag() == 0.0) {
+                wn_out[i] = Limits<f64>::infinity();
+                zeta_out[i] = 1.0;
+                continue;
+            }
             s = keel::log(s) / ts;
         }
         const f64 wn_i = keel::abs(s);
@@ -129,12 +135,21 @@ ControlStatus damp(ArrayRef<c64> poles, f64 ts, MutArrayRef<f64> wn_out,
 
 c64 evalfr_tf(ArrayRef<f64> num, ArrayRef<f64> den, f64 w, f64 ts) noexcept {
     const c64 s = freq_point(w, ts);
-    return horner_c64(num, s) / horner_c64(den, s);
+    const c64 nv = horner_c64(num, s);
+    const c64 dv = horner_c64(den, s);
+    if (dv == c64(0.0, 0.0)) {
+        if (nv == c64(0.0, 0.0)) {
+            const f64 nan = Limits<f64>::quiet_nan();
+            return c64(nan, nan);
+        }
+        return c64(Limits<f64>::infinity(), 0.0);
+    }
+    return nv / dv;
 }
 
 ControlStatus freqresp_tf(ArrayRef<f64> num, ArrayRef<f64> den, ArrayRef<f64> w, f64 ts,
                           MutArrayRef<c64> h_out) noexcept {
-    if (h_out.size() < w.size()) {
+    if (!keel::is_finite(ts) || h_out.size() < w.size()) {
         return ControlStatus::kInvalidArgument;
     }
     for (usize i = 0; i < w.size(); ++i) {
@@ -145,7 +160,7 @@ ControlStatus freqresp_tf(ArrayRef<f64> num, ArrayRef<f64> den, ArrayRef<f64> w,
 
 ControlStatus pick_freq_grid(ArrayRef<c64> poles, ArrayRef<c64> zeros, usize n_pts, f64 ts,
                              MutArrayRef<f64> w_out) noexcept {
-    if (w_out.size() < n_pts) {
+    if (!keel::is_finite(ts) || w_out.size() < n_pts) {
         return ControlStatus::kInvalidArgument;
     }
     if (n_pts == 0) {
@@ -157,8 +172,11 @@ ControlStatus pick_freq_grid(ArrayRef<c64> poles, ArrayRef<c64> zeros, usize n_p
     f64 max_m = 0.0;
     auto scan = [&](ArrayRef<c64> arr) noexcept {
         for (usize i = 0; i < arr.size(); ++i) {
+            if (!keel::is_finite(arr[i].real()) || !keel::is_finite(arr[i].imag())) {
+                continue;
+            }
             const f64 m = keel::abs(arr[i]);
-            if (m > 0.0) {
+            if (m > 0.0 && keel::is_finite(m)) {
                 if (!has_mag) {
                     min_m = m;
                     max_m = m;
@@ -198,14 +216,15 @@ ControlStatus pick_freq_grid(ArrayRef<c64> poles, ArrayRef<c64> zeros, usize n_p
 
 ControlStatus bode_tf(ArrayRef<f64> num, ArrayRef<f64> den, ArrayRef<f64> w, f64 ts,
                       MutArrayRef<f64> mag_out, MutArrayRef<f64> phase_deg_out, Allocator* alloc) {
-    if (mag_out.size() < w.size() || phase_deg_out.size() < w.size()) {
+    if (!keel::is_finite(ts) || mag_out.size() < w.size() || phase_deg_out.size() < w.size()) {
         return ControlStatus::kInvalidArgument;
     }
     constexpr f64 kRadToDeg = 180.0 / kPi;
+    ArenaTemp scratch = keel::get_scratch(alloc);
 
     f64 phi0 = 0.0;
     bool has_phi0 = false;
-    if (ts == 0.0 && !w.empty() && w[0] >= 0.0) {
+    if (ts <= 0.0 && !w.empty() && keel::is_finite(w[0]) && w[0] >= 0.0) {
         auto first_nz = [](ArrayRef<f64> v, usize& idx) noexcept -> f64 {
             for (usize i = 0; i < v.size(); ++i) {
                 if (v[i] != 0.0) {
@@ -232,7 +251,8 @@ ControlStatus bode_tf(ArrayRef<f64> num, ArrayRef<f64> den, ArrayRef<f64> w, f64
                 if (end - start <= 1) {
                     return ang;
                 }
-                const Array<c64> rts = keel::poly::roots(c.slice(start, end - start), alloc);
+                const Array<c64> rts =
+                    keel::poly::roots(c.slice(start, end - start), scratch.allocator());
                 for (usize k = 0; k < rts.size(); ++k) {
                     const c64 r = rts[k];
                     if (keel::abs(r.imag()) <= 1e-9 * keel::max(1.0, keel::abs(r.real()))) {
@@ -247,31 +267,35 @@ ControlStatus bode_tf(ArrayRef<f64> num, ArrayRef<f64> den, ArrayRef<f64> w, f64
             const f64 k_gain = b0 / a0;
             phi0 = (k_gain < 0.0 ? 180.0 : 0.0) + poly_phase_at(num, in_idx, w[0]) -
                    poly_phase_at(den, id_idx, w[0]);
-            has_phi0 = true;
+            has_phi0 = keel::is_finite(phi0);
         }
     }
 
     f64 prev = 0.0;
+    bool has_prev = false;
     for (usize i = 0; i < w.size(); ++i) {
         const c64 h = evalfr_tf(num, den, w[i], ts);
         mag_out[i] = keel::abs(h);
-        f64 ph = keel::arg(h) * kRadToDeg;
-        if (i == 0 && has_phi0) {
-            while (ph - phi0 > 180.0) ph -= 360.0;
-            while (ph - phi0 < -180.0) ph += 360.0;
-        } else if (i > 0) {
-            while (ph - prev > 180.0) ph -= 360.0;
-            while (ph - prev < -180.0) ph += 360.0;
+        f64 ph = (keel::is_finite(h.real()) && keel::is_finite(h.imag()))
+                     ? (keel::arg(h) * kRadToDeg)
+                     : Limits<f64>::quiet_nan();
+        if (keel::is_finite(ph)) {
+            if (!has_prev && has_phi0) {
+                ph -= 360.0 * keel::round((ph - phi0) / 360.0);
+            } else if (has_prev) {
+                ph -= 360.0 * keel::round((ph - prev) / 360.0);
+            }
+            prev = ph;
+            has_prev = true;
         }
         phase_deg_out[i] = ph;
-        prev = ph;
     }
     return ControlStatus::kOk;
 }
 
 ControlStatus nyquist_tf(ArrayRef<f64> num, ArrayRef<f64> den, ArrayRef<f64> w, f64 ts,
                          MutArrayRef<f64> re_out, MutArrayRef<f64> im_out) noexcept {
-    if (re_out.size() < w.size() || im_out.size() < w.size()) {
+    if (!keel::is_finite(ts) || re_out.size() < w.size() || im_out.size() < w.size()) {
         return ControlStatus::kInvalidArgument;
     }
     for (usize i = 0; i < w.size(); ++i) {
@@ -286,19 +310,21 @@ ControlStatus rlocus_tf(ArrayRef<f64> num_in, ArrayRef<f64> den_in, ArrayRef<f64
                         usize n_poles, MutArrayRef<c64> roots_out, Allocator* alloc) {
     const ArrayRef<f64> num = strip_leading(num_in);
     const ArrayRef<f64> den = strip_leading(den_in);
-    if (den.empty()) {
+    if (den.empty() || den[0] == 0.0) {
         return ControlStatus::kInvalidArgument;
     }
     const usize n = den.size() - 1;
     const usize k_cnt = gains.size();
-    if (n_poles != n || roots_out.size() < k_cnt * n) {
+    if (n_poles != n || (n > 0 && roots_out.size() / n < k_cnt)) {
         return ControlStatus::kInvalidArgument;
     }
     if (n == 0 || k_cnt == 0) {
         return ControlStatus::kOk;
     }
 
-    Array<f64> num_aligned(den.size(), 0.0, alloc);
+    ArenaTemp scratch = keel::get_scratch(alloc);
+    Allocator* sa = scratch.allocator();
+    Array<f64> num_aligned(den.size(), 0.0, sa);
     if (num.size() <= den.size()) {
         const usize pad = den.size() - num.size();
         for (usize i = 0; i < num.size(); ++i) {
@@ -308,13 +334,13 @@ ControlStatus rlocus_tf(ArrayRef<f64> num_in, ArrayRef<f64> den_in, ArrayRef<f64
         return ControlStatus::kInvalidArgument;
     }
 
-    Array<f64> cpoly(den.size(), 0.0, alloc);
+    Array<f64> cpoly(den.size(), 0.0, sa);
     for (usize row = 0; row < k_cnt; ++row) {
         const f64 k = gains[row];
         for (usize i = 0; i < den.size(); ++i) {
             cpoly[i] = den[i] + k * num_aligned[i];
         }
-        const Array<c64> rts = keel::poly::roots(cpoly.as_ref(), alloc);
+        const Array<c64> rts = keel::poly::roots(cpoly.as_ref(), sa);
         for (usize j = 0; j < n; ++j) {
             roots_out[j * k_cnt + row] = (j < rts.size()) ? rts[j] : c64(0.0, 0.0);
         }
@@ -330,7 +356,8 @@ ControlStatus margin_from_bode(ArrayRef<f64> w, ArrayRef<f64> mag, ArrayRef<f64>
     }
     const CrossHit pc = find_first_crossing(w, phase_deg, -180.0);
 
-    Array<f64> mag_db(n, 0.0, alloc);
+    ArenaTemp scratch = keel::get_scratch(alloc);
+    Array<f64> mag_db(n, 0.0, scratch.allocator());
     for (usize i = 0; i < n; ++i) {
         mag_db[i] = (mag[i] > 0.0) ? (20.0 * keel::log10(mag[i])) : -300.0;
     }
@@ -357,10 +384,13 @@ ControlStatus margin_from_bode(ArrayRef<f64> w, ArrayRef<f64> mag, ArrayRef<f64>
 
 ControlStatus allmargin_tf(ArrayRef<f64> num, ArrayRef<f64> den, AllMarginResult& out,
                            Allocator* alloc) {
-    if (den.empty()) {
+    const ArrayRef<f64> den_s = strip_leading(den);
+    if (den_s.empty() || den_s[0] == 0.0) {
         return ControlStatus::kInvalidArgument;
     }
     const f64 inf = Limits<f64>::infinity();
+    ArenaTemp scratch = keel::get_scratch(alloc);
+    Allocator* sa = scratch.allocator();
 
     f64 wlo = 1e-3;
     f64 whi = 1e3;
@@ -372,10 +402,10 @@ ControlStatus allmargin_tf(ArrayRef<f64> num, ArrayRef<f64> den, AllMarginResult
             if (c.size() < 2) {
                 return;
             }
-            const Array<c64> rts = keel::poly::roots(c, alloc);
+            const Array<c64> rts = keel::poly::roots(c, sa);
             for (usize i = 0; i < rts.size(); ++i) {
                 const f64 m = keel::abs(rts[i]);
-                if (m > 1e-9) {
+                if (m > 1e-9 && keel::is_finite(m)) {
                     if (!has_mag) {
                         min_m = m;
                         max_m = m;
@@ -388,7 +418,7 @@ ControlStatus allmargin_tf(ArrayRef<f64> num, ArrayRef<f64> den, AllMarginResult
             }
         };
         add_roots(num);
-        add_roots(den);
+        add_roots(den_s);
         if (has_mag) {
             wlo = min_m * 1e-3;
             whi = max_m * 1e3;
@@ -406,41 +436,58 @@ ControlStatus allmargin_tf(ArrayRef<f64> num, ArrayRef<f64> den, AllMarginResult
     const f64 llo = keel::log10(wlo);
     const f64 lhi = keel::log10(whi);
     f64 w_prev = wlo;
-    c64 g_prev = eval_g_jw(num, den, w_prev);
+    c64 g_prev = eval_g_jw(num, den_s, w_prev);
+
+    auto record_pm = [&](f64 wc) {
+        const c64 gc = eval_g_jw(num, den_s, wc);
+        f64 pm = keel::arg(gc) * (180.0 / kPi) + 180.0;
+        pm -= 360.0 * keel::round(pm / 360.0);
+        if (pm <= -180.0) pm += 360.0;
+        out.phase_margin.push_back(pm);
+        out.pm_frequency.push_back(wc);
+        f64 pm_rad = pm * (kPi / 180.0);
+        if (pm_rad < 0.0) pm_rad += 2.0 * kPi;
+        out.delay_margin.push_back(wc > 0.0 ? (pm_rad / wc) : inf);
+        out.dm_frequency.push_back(wc);
+    };
+
+    auto record_gm = [&](f64 wc) {
+        const c64 gc = eval_g_jw(num, den_s, wc);
+        if (gc.real() < 0.0) {
+            const f64 m = keel::abs(gc);
+            out.gain_margin.push_back(m > 0.0 ? (1.0 / m) : inf);
+            out.gm_frequency.push_back(wc);
+        }
+    };
 
     for (i32 i = 1; i <= kSteps; ++i) {
         const f64 w = keel::pow(10.0, llo + (lhi - llo) * as<f64>(i) / as<f64>(kSteps));
-        const c64 g = eval_g_jw(num, den, w);
+        const c64 g = eval_g_jw(num, den_s, w);
 
-        // Gain crossover: |G| - 1 changes sign.
+        // Gain crossover: |G| - 1 changes sign or hits 0 exactly at w.
         const f64 a = keel::abs(g_prev) - 1.0;
         const f64 b = keel::abs(g) - 1.0;
-        if (keel::is_finite(a) && keel::is_finite(b) && a != 0.0 && (a < 0.0) != (b < 0.0)) {
-            const f64 wc = bisect_root(
-                [&](f64 x) noexcept { return keel::abs(eval_g_jw(num, den, x)) - 1.0; }, w_prev, w);
-            const c64 gc = eval_g_jw(num, den, wc);
-            f64 pm = keel::arg(gc) * (180.0 / kPi) + 180.0;
-            while (pm > 180.0) pm -= 360.0;
-            while (pm <= -180.0) pm += 360.0;
-            out.phase_margin.push_back(pm);
-            out.pm_frequency.push_back(wc);
-            f64 pm_rad = pm * (kPi / 180.0);
-            while (pm_rad < 0.0) pm_rad += 2.0 * kPi;
-            out.delay_margin.push_back(wc > 0.0 ? (pm_rad / wc) : inf);
-            out.dm_frequency.push_back(wc);
+        if (keel::is_finite(a) && keel::is_finite(b)) {
+            if (b == 0.0) {
+                record_pm(w);
+            } else if (a != 0.0 && (a < 0.0) != (b < 0.0)) {
+                const f64 wc = bisect_root(
+                    [&](f64 x) noexcept { return keel::abs(eval_g_jw(num, den_s, x)) - 1.0; },
+                    w_prev, w);
+                record_pm(wc);
+            }
         }
 
-        // Phase crossover: Im(G) changes sign with Re(G) < 0.
+        // Phase crossover: Im(G) changes sign or hits 0 exactly at w with Re(G) < 0.
         const f64 ia = g_prev.imag();
         const f64 ib = g.imag();
-        if (keel::is_finite(ia) && keel::is_finite(ib) && ia != 0.0 && (ia < 0.0) != (ib < 0.0)) {
-            const f64 wc = bisect_root(
-                [&](f64 x) noexcept { return eval_g_jw(num, den, x).imag(); }, w_prev, w);
-            const c64 gc = eval_g_jw(num, den, wc);
-            if (gc.real() < 0.0) {
-                const f64 m = keel::abs(gc);
-                out.gain_margin.push_back(m > 0.0 ? (1.0 / m) : inf);
-                out.gm_frequency.push_back(wc);
+        if (keel::is_finite(ia) && keel::is_finite(ib)) {
+            if (ib == 0.0) {
+                record_gm(w);
+            } else if (ia != 0.0 && (ia < 0.0) != (ib < 0.0)) {
+                const f64 wc = bisect_root(
+                    [&](f64 x) noexcept { return eval_g_jw(num, den_s, x).imag(); }, w_prev, w);
+                record_gm(wc);
             }
         }
         w_prev = w;
@@ -449,17 +496,17 @@ ControlStatus allmargin_tf(ArrayRef<f64> num, ArrayRef<f64> den, AllMarginResult
 
     // Closed-loop stability: roots(den + num) all strictly in LHP.
     bool stable = true;
-    const usize l = keel::max(num.size(), den.size());
-    Array<f64> cl(l, 0.0, alloc);
-    for (usize i = 0; i < den.size(); ++i) {
-        cl[l - den.size() + i] += den[i];
+    const usize l = keel::max(num.size(), den_s.size());
+    Array<f64> cl(l, 0.0, sa);
+    for (usize i = 0; i < den_s.size(); ++i) {
+        cl[l - den_s.size() + i] += den_s[i];
     }
     for (usize i = 0; i < num.size(); ++i) {
         cl[l - num.size() + i] += num[i];
     }
     const ArrayRef<f64> cl_trim = strip_leading(cl.as_ref());
     if (cl_trim.size() >= 2) {
-        const Array<c64> rts = keel::poly::roots(cl_trim, alloc);
+        const Array<c64> rts = keel::poly::roots(cl_trim, sa);
         for (usize i = 0; i < rts.size(); ++i) {
             if (rts[i].real() >= -1e-9) {
                 stable = false;

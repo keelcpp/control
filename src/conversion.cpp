@@ -1,5 +1,6 @@
 #include "keel/control.h"
 
+#include "keel/arena.h"
 #include "keel/array.h"
 #include "keel/math.h"
 #include "keel/poly.h"
@@ -16,28 +17,40 @@ ArrayRef<f64> strip_leading_zeros(ArrayRef<f64> v) noexcept {
     return v.slice(i);
 }
 
+bool all_finite(ArrayRef<f64> v) noexcept {
+    for (usize i = 0; i < v.size(); ++i) {
+        if (!keel::is_finite(v[i])) return false;
+    }
+    return true;
+}
+
 } // namespace
 
 ControlStatus tf2ss(ArrayRef<f64> num, ArrayRef<f64> den, StateSpace& out, Allocator* alloc) {
+    if (!all_finite(num) || !all_finite(den)) {
+        return ControlStatus::kInvalidArgument;
+    }
+    const ArrayRef<f64> num_s = strip_leading_zeros(num);
     const ArrayRef<f64> den_s = strip_leading_zeros(den);
     if (den_s.empty() || den_s[0] == 0.0) {
         return ControlStatus::kInvalidArgument;
     }
-    if (num.size() > den_s.size()) {
+    if (num_s.size() > den_s.size()) {
         return ControlStatus::kInvalidArgument;
     }
 
+    ArenaTemp scratch = keel::get_scratch(alloc);
     const f64 a0 = den_s[0];
     const usize m = den_s.size();
-    Array<f64> a(m, 0.0, alloc);
+    Array<f64> a(m, 0.0, scratch.allocator());
     for (usize i = 0; i < m; ++i) {
         a[i] = den_s[i] / a0;
     }
 
-    Array<f64> b(m, 0.0, alloc);
-    const usize pad = m - num.size();
-    for (usize i = 0; i < num.size(); ++i) {
-        b[pad + i] = num[i] / a0;
+    Array<f64> b(m, 0.0, scratch.allocator());
+    const usize pad = m - num_s.size();
+    for (usize i = 0; i < num_s.size(); ++i) {
+        b[pad + i] = num_s[i] / a0;
     }
 
     const usize n = m - 1;
@@ -69,10 +82,10 @@ ControlStatus ss2tf(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> c, f64 d_sca
                     usize nu, usize iu, Array<f64>& num_out, Array<f64>& den_out,
                     Allocator* alloc) {
     const usize eff_nu = (nu == 0) ? 1 : nu;
-    if (iu >= eff_nu || a.size() < n * n || c.size() < n) {
+    if (iu >= eff_nu || !keel::is_finite(d_scalar) || (n > 0 && a.size() / n < n) || c.size() < n) {
         return ControlStatus::kInvalidArgument;
     }
-    if (n > 0 && b.size() < (iu + 1) * n) {
+    if (n > 0 && b.size() / n < iu + 1) {
         return ControlStatus::kInvalidArgument;
     }
 
@@ -86,15 +99,25 @@ ControlStatus ss2tf(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> c, f64 d_sca
         return ControlStatus::kOk;
     }
 
-    Array<f64> bv(n, 0.0, alloc);
+    for (usize i = 0; i < n * n; ++i) {
+        if (!keel::is_finite(a[i])) return ControlStatus::kInvalidArgument;
+    }
+    for (usize i = 0; i < n; ++i) {
+        if (!keel::is_finite(b[iu * n + i]) || !keel::is_finite(c[i])) {
+            return ControlStatus::kInvalidArgument;
+        }
+    }
+
+    ArenaTemp scratch = keel::get_scratch(alloc);
+    Array<f64> bv(n, 0.0, scratch.allocator());
     for (usize i = 0; i < n; ++i) {
         bv[i] = b[iu * n + i];
     }
 
     // Faddeev-LeVerrier: M_0 = I, c_k = -(1/k) * tr(A * M_{k-1}), M_k = A * M_{k-1} + c_k * I.
-    Array<f64> m_cur(n * n, 0.0, alloc);
-    Array<f64> am(n * n, 0.0, alloc);
-    Array<f64> mb(n, 0.0, alloc);
+    Array<f64> m_cur(n * n, 0.0, scratch.allocator());
+    Array<f64> am(n * n, 0.0, scratch.allocator());
+    Array<f64> mb(n, 0.0, scratch.allocator());
     for (usize i = 0; i < n; ++i) {
         m_cur[i * n + i] = 1.0;
     }
@@ -164,6 +187,9 @@ ControlStatus ss2tf(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> c, f64 d_sca
 
 ControlStatus minreal_tf(ArrayRef<f64> num, ArrayRef<f64> den, f64 tol, Array<f64>& num_out,
                          Array<f64>& den_out, Allocator* alloc) {
+    if (keel::is_nan(tol) || !all_finite(num) || !all_finite(den)) {
+        return ControlStatus::kInvalidArgument;
+    }
     const ArrayRef<f64> num_s = strip_leading_zeros(num);
     const ArrayRef<f64> den_s = strip_leading_zeros(den);
     if (den_s.empty() || den_s[0] == 0.0) {
@@ -176,12 +202,13 @@ ControlStatus minreal_tf(ArrayRef<f64> num, ArrayRef<f64> den, f64 tol, Array<f6
     const f64 num_lead = num_s.empty() ? 0.0 : num_s[0];
     const f64 den_lead = den_s[0];
 
-    const Array<c64> z = keel::poly::roots(num, alloc);
-    const Array<c64> p = keel::poly::roots(den, alloc);
+    ArenaTemp scratch = keel::get_scratch(alloc);
+    const Array<c64> z = keel::poly::roots(num_s, scratch.allocator());
+    const Array<c64> p = keel::poly::roots(den_s, scratch.allocator());
 
-    Array<u8> zused(z.size(), u8{0}, alloc);
-    Array<c64> rem_p(alloc);
-    Array<c64> rem_z(alloc);
+    Array<u8> zused(z.size(), u8{0}, scratch.allocator());
+    Array<c64> rem_p(scratch.allocator());
+    Array<c64> rem_z(scratch.allocator());
     rem_p.reserve(p.size());
     rem_z.reserve(z.size());
 

@@ -2,16 +2,33 @@
 
 #include "keel/arena.h"
 #include "keel/array.h"
+#include "keel/math.h"
 
 namespace keel::control {
 
+namespace {
+
+inline bool check_lyap_dims(usize n, usize a_sz, usize q_sz, usize x_sz) noexcept {
+    if (n == 0) return true;
+    if (a_sz / n < n || q_sz / n < n || x_sz / n < n) return false;
+    const usize n2 = n * n;
+    return n2 <= Limits<usize>::kMax / n2;
+}
+
+} // namespace
+
 ControlStatus lyap(ArrayRef<f64> a, ArrayRef<f64> q, usize n, MutArrayRef<f64> x,
                    Allocator* alloc) {
-    const usize n2 = n * n;
-    if (a.size() < n2 || q.size() < n2 || x.size() < n2) {
+    if (!check_lyap_dims(n, a.size(), q.size(), x.size())) {
         return ControlStatus::kInvalidArgument;
     }
     if (n == 0) return ControlStatus::kOk;
+    const usize n2 = n * n;
+    for (usize i = 0; i < n2; ++i) {
+        if (!keel::is_finite(a[i]) || !keel::is_finite(q[i])) {
+            return ControlStatus::kInvalidArgument;
+        }
+    }
 
     ArenaTemp scratch = keel::get_scratch(alloc);
     Array<f64> m(n2 * n2, 0.0, scratch.allocator());
@@ -54,11 +71,17 @@ ControlStatus lyap(ArrayRef<f64> a, ArrayRef<f64> q, usize n, MutArrayRef<f64> x
 
 ControlStatus lyap_c64(ArrayRef<c64> a, ArrayRef<c64> q, usize n, MutArrayRef<c64> x,
                        Allocator* alloc) {
-    const usize n2 = n * n;
-    if (a.size() < n2 || q.size() < n2 || x.size() < n2) {
+    if (!check_lyap_dims(n, a.size(), q.size(), x.size())) {
         return ControlStatus::kInvalidArgument;
     }
     if (n == 0) return ControlStatus::kOk;
+    const usize n2 = n * n;
+    for (usize i = 0; i < n2; ++i) {
+        if (!keel::is_finite(a[i].real()) || !keel::is_finite(a[i].imag()) ||
+            !keel::is_finite(q[i].real()) || !keel::is_finite(q[i].imag())) {
+            return ControlStatus::kInvalidArgument;
+        }
+    }
 
     ArenaTemp scratch = keel::get_scratch(alloc);
     Array<c64> m(n2 * n2, c64(0.0, 0.0), scratch.allocator());
@@ -101,11 +124,16 @@ ControlStatus lyap_c64(ArrayRef<c64> a, ArrayRef<c64> q, usize n, MutArrayRef<c6
 
 ControlStatus dlyap(ArrayRef<f64> a, ArrayRef<f64> q, usize n, MutArrayRef<f64> x,
                     Allocator* alloc) {
-    const usize n2 = n * n;
-    if (a.size() < n2 || q.size() < n2 || x.size() < n2) {
+    if (!check_lyap_dims(n, a.size(), q.size(), x.size())) {
         return ControlStatus::kInvalidArgument;
     }
     if (n == 0) return ControlStatus::kOk;
+    const usize n2 = n * n;
+    for (usize i = 0; i < n2; ++i) {
+        if (!keel::is_finite(a[i]) || !keel::is_finite(q[i])) {
+            return ControlStatus::kInvalidArgument;
+        }
+    }
 
     ArenaTemp scratch = keel::get_scratch(alloc);
     Array<f64> m(n2 * n2, 0.0, scratch.allocator());
@@ -144,11 +172,17 @@ ControlStatus dlyap(ArrayRef<f64> a, ArrayRef<f64> q, usize n, MutArrayRef<f64> 
 
 ControlStatus dlyap_c64(ArrayRef<c64> a, ArrayRef<c64> q, usize n, MutArrayRef<c64> x,
                         Allocator* alloc) {
-    const usize n2 = n * n;
-    if (a.size() < n2 || q.size() < n2 || x.size() < n2) {
+    if (!check_lyap_dims(n, a.size(), q.size(), x.size())) {
         return ControlStatus::kInvalidArgument;
     }
     if (n == 0) return ControlStatus::kOk;
+    const usize n2 = n * n;
+    for (usize i = 0; i < n2; ++i) {
+        if (!keel::is_finite(a[i].real()) || !keel::is_finite(a[i].imag()) ||
+            !keel::is_finite(q[i].real()) || !keel::is_finite(q[i].imag())) {
+            return ControlStatus::kInvalidArgument;
+        }
+    }
 
     ArenaTemp scratch = keel::get_scratch(alloc);
     Array<c64> m(n2 * n2, c64(0.0, 0.0), scratch.allocator());

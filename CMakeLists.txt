@@ -18,7 +18,7 @@ if(NOT TARGET keel::keel)
     FetchContent_Declare(
         keel
         GIT_REPOSITORY https://github.com/keelcpp/keel.git
-        GIT_TAG        869a5c07a5d77341e5f6acbac5f8e024b274ea08
+        GIT_TAG        4b37783925fe7af7a64daaff90f268df267fbbf3
     )
     FetchContent_MakeAvailable(keel)
 endif()
@@ -41,7 +41,7 @@ if(NOT TARGET keel::poly)
     FetchContent_Declare(
         keel_poly
         GIT_REPOSITORY https://github.com/keelcpp/poly.git
-        GIT_TAG        87429cfe8d8a3353b24ffdfa7385baba42c049ee
+        GIT_TAG        49f000d390c73b0cb426f41f11465aaf0f24e82a
     )
     FetchContent_MakeAvailable(keel_poly)
 endif()
@@ -64,7 +64,7 @@ if(NOT TARGET keel::linalg)
     FetchContent_Declare(
         keel_linalg
         GIT_REPOSITORY https://github.com/keelcpp/linalg.git
-        GIT_TAG        bfbb5449d06dae36a3bafe8f80700082d8201b01
+        GIT_TAG        1bc2798c7905a9431285c1d2617f619233c43640
     )
     FetchContent_MakeAvailable(keel_linalg)
 endif()

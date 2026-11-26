@@ -2,15 +2,26 @@
 
 #include "keel/arena.h"
 #include "keel/array.h"
+#include "keel/math.h"
 
 namespace keel::control {
 
 ControlStatus acker_from_poly(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> char_poly_coeffs,
                               usize n, MutArrayRef<f64> k_out, Allocator* alloc) {
-    if (a.size() < n * n || b.size() < n || char_poly_coeffs.size() < n + 1 || k_out.size() < n) {
+    if ((n > 0 && a.size() / n < n) || b.size() < n || char_poly_coeffs.size() < n + 1 ||
+        k_out.size() < n) {
         return ControlStatus::kInvalidArgument;
     }
     if (n == 0) return ControlStatus::kOk;
+    for (usize i = 0; i < n * n; ++i) {
+        if (!keel::is_finite(a[i])) return ControlStatus::kInvalidArgument;
+    }
+    for (usize i = 0; i < n; ++i) {
+        if (!keel::is_finite(b[i])) return ControlStatus::kInvalidArgument;
+    }
+    for (usize i = 0; i <= n; ++i) {
+        if (!keel::is_finite(char_poly_coeffs[i])) return ControlStatus::kInvalidArgument;
+    }
 
     ArenaTemp scratch = keel::get_scratch(alloc);
     Allocator* sa = scratch.allocator();
@@ -52,7 +63,8 @@ ControlStatus acker_from_poly(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> ch
 
 ControlStatus acker_from_poly_c64(ArrayRef<c64> a, ArrayRef<c64> b, ArrayRef<f64> char_poly_coeffs,
                                   usize n, MutArrayRef<c64> k_out, Allocator* alloc) {
-    if (a.size() < n * n || b.size() < n || char_poly_coeffs.size() < n + 1 || k_out.size() < n) {
+    if ((n > 0 && a.size() / n < n) || b.size() < n || char_poly_coeffs.size() < n + 1 ||
+        k_out.size() < n) {
         return ControlStatus::kInvalidArgument;
     }
     if (n == 0) return ControlStatus::kOk;
@@ -110,6 +122,11 @@ ControlStatus acker(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<c64> poles, usize
     if (poles.size() < n) {
         return ControlStatus::kInvalidArgument;
     }
+    for (usize i = 0; i < n; ++i) {
+        if (!keel::is_finite(poles[i].real()) || !keel::is_finite(poles[i].imag())) {
+            return ControlStatus::kInvalidArgument;
+        }
+    }
     ArenaTemp scratch = keel::get_scratch(alloc);
     Allocator* sa = scratch.allocator();
 
@@ -121,8 +138,17 @@ ControlStatus acker(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<c64> poles, usize
             cp[j] = cp[j] - p * cp[j - 1];
         }
     }
+    f64 max_re = 1.0;
+    for (usize i = 0; i <= n; ++i) {
+        max_re = keel::max(max_re, keel::abs(cp[i].real()));
+    }
     Array<f64> cr(n + 1, sa);
-    for (usize i = 0; i <= n; ++i) cr[i] = cp[i].real();
+    for (usize i = 0; i <= n; ++i) {
+        if (keel::abs(cp[i].imag()) > 1e-8 * max_re) {
+            return ControlStatus::kInvalidArgument;
+        }
+        cr[i] = cp[i].real();
+    }
     return acker_from_poly(a, b, cr, n, k_out, sa);
 }
 

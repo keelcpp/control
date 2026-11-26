@@ -30,39 +30,67 @@ bool invert_mat(ArrayRef<f64> a, usize n, MutArrayRef<f64> out, Allocator* scrat
 }
 
 [[nodiscard]] f64 frob_norm(ArrayRef<f64> a) noexcept {
+    f64 mx = 0.0;
+    for (usize i = 0; i < a.size(); ++i) {
+        const f64 v = keel::abs(a[i]);
+        if (!keel::is_finite(v)) return Limits<f64>::quiet_nan();
+        if (v > mx) mx = v;
+    }
+    if (mx == 0.0) return 0.0;
+    const f64 inv = 1.0 / mx;
     f64 s = 0.0;
     for (usize i = 0; i < a.size(); ++i) {
-        s += a[i] * a[i];
+        const f64 u = a[i] * inv;
+        s += u * u;
     }
-    return keel::sqrt(s);
+    return mx * keel::sqrt(s);
+}
+
+bool all_finite(ArrayRef<f64> v, usize count) noexcept {
+    for (usize i = 0; i < count; ++i) {
+        if (!keel::is_finite(v[i])) return false;
+    }
+    return true;
 }
 
 bool matsign(MutArrayRef<f64> z, usize k, Allocator* scratch_alloc) {
     const usize k2 = k * k;
-    constexpr f64 tol = 1e-14;
+    constexpr f64 tol = 1e-13;
     Array<f64> zi(k2, scratch_alloc);
     Array<f64> zn(k2, scratch_alloc);
 
+    bool converged = false;
     for (i32 iter = 0; iter < 200; ++iter) {
         if (!invert_mat(z, k, zi, scratch_alloc)) {
             return false;
         }
-        const f64 c = keel::sqrt(frob_norm(zi) / keel::max(frob_norm(z), 1e-300));
-        f64 diff = 0.0;
-        f64 scale = 0.0;
+        const f64 nz = frob_norm(z);
+        const f64 nzi = frob_norm(zi);
+        if (!keel::is_finite(nz) || !keel::is_finite(nzi) || nz == 0.0 || nzi == 0.0) {
+            return false;
+        }
+        const f64 c = keel::sqrt(nzi / nz);
+        if (!keel::is_finite(c) || c == 0.0) {
+            return false;
+        }
+        f64 max_diff = 0.0;
+        f64 max_val = 0.0;
         for (usize i = 0; i < k2; ++i) {
             const f64 v = 0.5 * (c * z[i] + zi[i] / c);
+            if (!keel::is_finite(v)) return false;
             zn[i] = v;
-            const f64 d = v - z[i];
-            diff += d * d;
-            scale += v * v;
+            const f64 d = keel::abs(v - z[i]);
+            if (d > max_diff) max_diff = d;
+            const f64 av = keel::abs(v);
+            if (av > max_val) max_val = av;
         }
         for (usize i = 0; i < k2; ++i) z[i] = zn[i];
-        if (keel::sqrt(diff) <= tol * keel::sqrt(keel::max(scale, 1e-300))) {
+        if (max_diff <= tol * keel::max(max_val, 1.0)) {
+            converged = true;
             break;
         }
     }
-    return true;
+    return converged;
 }
 
 bool subspace_to_x(ArrayRef<f64> s, usize n, MutArrayRef<f64> x_out, Allocator* scratch_alloc) {
@@ -106,27 +134,33 @@ bool subspace_to_x(ArrayRef<f64> s, usize n, MutArrayRef<f64> x_out, Allocator* 
 
 ControlStatus care(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> q, ArrayRef<f64> r, usize n,
                    usize m, MutArrayRef<f64> x_out, MutArrayRef<f64> g_out, Allocator* alloc) {
-    if (a.size() < n * n || b.size() < n * m || q.size() < n * n || r.size() < m * m ||
-        x_out.size() < n * n || (!g_out.empty() && g_out.size() < m * n)) {
+    if ((n > 0 && (a.size() / n < n || q.size() / n < n || x_out.size() / n < n ||
+                   n > Limits<usize>::kMax / 4u || (2u * n) > Limits<usize>::kMax / (2u * n))) ||
+        (m > 0 && (r.size() / m < m || (n > 0 && b.size() / m < n) ||
+                   (!g_out.empty() && n > 0 && g_out.size() / n < m)))) {
         return ControlStatus::kInvalidArgument;
     }
     if (n == 0) return ControlStatus::kOk;
+    if (!all_finite(a, n * n) || !all_finite(b, n * m) || !all_finite(q, n * n) ||
+        !all_finite(r, m * m)) {
+        return ControlStatus::kInvalidArgument;
+    }
 
     ArenaTemp scratch = keel::get_scratch(alloc);
     Allocator* sa = scratch.allocator();
 
-    Array<f64> ri(m * m, sa);
-    if (!invert_mat(r, m, ri, sa)) {
-        return ControlStatus::kSingularR;
+    Array<f64> ri(m * m, 0.0, sa);
+    Array<f64> bt(m * n, 0.0, sa);
+    Array<f64> gbr(n * n, 0.0, sa);
+    if (m > 0) {
+        if (!invert_mat(r, m, ri, sa)) {
+            return ControlStatus::kSingularR;
+        }
+        transpose_mat(b, n, m, bt);
+        Array<f64> ri_bt(m * n, sa);
+        (void)matmul(ri, m, m, bt, n, ri_bt);
+        (void)matmul(b, n, m, ri_bt, n, gbr);
     }
-
-    Array<f64> bt(m * n, sa);
-    transpose_mat(b, n, m, bt);
-
-    Array<f64> ri_bt(m * n, sa);
-    Array<f64> gbr(n * n, sa);
-    (void)matmul(ri, m, m, bt, n, ri_bt);
-    (void)matmul(b, n, m, ri_bt, n, gbr);
 
     const usize k = 2 * n;
     Array<f64> h(k * k, 0.0, sa);
@@ -149,7 +183,7 @@ ControlStatus care(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> q, ArrayRef<f
         return ControlStatus::kSingularSubspace;
     }
 
-    if (!g_out.empty()) {
+    if (!g_out.empty() && m > 0) {
         Array<f64> bt_x(m * n, sa);
         (void)matmul(bt, m, n, x_out, n, bt_x);
         (void)matmul(ri, m, m, bt_x, n, g_out);
@@ -159,71 +193,60 @@ ControlStatus care(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> q, ArrayRef<f
 
 ControlStatus dare(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> q, ArrayRef<f64> r, usize n,
                    usize m, MutArrayRef<f64> x_out, MutArrayRef<f64> g_out, Allocator* alloc) {
-    if (a.size() < n * n || b.size() < n * m || q.size() < n * n || r.size() < m * m ||
-        x_out.size() < n * n || (!g_out.empty() && g_out.size() < m * n)) {
+    if ((n > 0 && (a.size() / n < n || q.size() / n < n || x_out.size() / n < n ||
+                   n > Limits<usize>::kMax / 4u || (2u * n) > Limits<usize>::kMax / (2u * n))) ||
+        (m > 0 && (r.size() / m < m || (n > 0 && b.size() / m < n) ||
+                   (!g_out.empty() && n > 0 && g_out.size() / n < m)))) {
         return ControlStatus::kInvalidArgument;
     }
     if (n == 0) return ControlStatus::kOk;
+    if (!all_finite(a, n * n) || !all_finite(b, n * m) || !all_finite(q, n * n) ||
+        !all_finite(r, m * m)) {
+        return ControlStatus::kInvalidArgument;
+    }
 
     ArenaTemp scratch = keel::get_scratch(alloc);
     Allocator* sa = scratch.allocator();
 
-    Array<f64> ri(m * m, sa);
-    if (!invert_mat(r, m, ri, sa)) {
-        return ControlStatus::kSingularR;
+    Array<f64> ri(m * m, 0.0, sa);
+    Array<f64> bt(m * n, 0.0, sa);
+    Array<f64> gbr(n * n, 0.0, sa);
+    if (m > 0) {
+        if (!invert_mat(r, m, ri, sa)) {
+            return ControlStatus::kSingularR;
+        }
+        transpose_mat(b, n, m, bt);
+        Array<f64> ri_bt(m * n, sa);
+        (void)matmul(ri, m, m, bt, n, ri_bt);
+        (void)matmul(b, n, m, ri_bt, n, gbr);
     }
-    Array<f64> ai(n * n, sa);
-    if (!invert_mat(a, n, ai, sa)) {
-        return ControlStatus::kSingularA;
-    }
 
-    Array<f64> bt(m * n, sa);
-    transpose_mat(b, n, m, bt);
+    Array<f64> at(n * n, sa);
+    transpose_mat(a, n, n, at);
 
-    Array<f64> ri_bt(m * n, sa);
-    Array<f64> gbr(n * n, sa);
-    (void)matmul(ri, m, m, bt, n, ri_bt);
-    (void)matmul(b, n, m, ri_bt, n, gbr);
-
-    Array<f64> ait(n * n, sa);
-    transpose_mat(ai, n, n, ait);
-
-    Array<f64> gbr_ait(n * n, sa);
-    Array<f64> ait_q(n * n, sa);
-    Array<f64> top(n * n, sa);
-    (void)matmul(gbr, n, n, ait, n, gbr_ait);
-    (void)matmul(ait, n, n, q, n, ait_q);
-    (void)matmul(gbr_ait, n, n, q, n, top);
-
+    // Symplectic pencil M - lambda * L with M = [A, 0; -Q, I], L = [I, G; 0, A^T].
+    // Direct Cayley transform C = (M + L)^{-1} (M - L) works even for singular A.
     const usize k = 2 * n;
-    Array<f64> sp(k * k, 0.0, sa);
+    Array<f64> mpl(k * k, 0.0, sa);
+    Array<f64> cayley(k * k, 0.0, sa);
     for (usize j = 0; j < n; ++j) {
         for (usize i = 0; i < n; ++i) {
-            sp[j * k + i] = a[j * n + i] + top[j * n + i];
-            sp[(n + j) * k + i] = -gbr_ait[j * n + i];
-            sp[j * k + (n + i)] = -ait_q[j * n + i];
-            sp[(n + j) * k + (n + i)] = ait[j * n + i];
+            const f64 eye = (i == j) ? 1.0 : 0.0;
+            mpl[j * k + i] = a[j * n + i] + eye;
+            mpl[(n + j) * k + i] = gbr[j * n + i];
+            mpl[j * k + (n + i)] = -q[j * n + i];
+            mpl[(n + j) * k + (n + i)] = eye + at[j * n + i];
+
+            cayley[j * k + i] = a[j * n + i] - eye;
+            cayley[(n + j) * k + i] = -gbr[j * n + i];
+            cayley[j * k + (n + i)] = -q[j * n + i];
+            cayley[(n + j) * k + (n + i)] = eye - at[j * n + i];
         }
     }
 
-    Array<f64> smi(k * k, sa);
-    Array<f64> spi(k * k, sa);
-    for (usize i = 0; i < k * k; ++i) {
-        smi[i] = sp[i];
-        spi[i] = sp[i];
-    }
-    for (usize i = 0; i < k; ++i) {
-        smi[i * k + i] -= 1.0;
-        spi[i * k + i] += 1.0;
-    }
-
-    Array<f64> spi_inv(k * k, sa);
-    if (!invert_mat(spi, k, spi_inv, sa)) {
+    if (solve_in_place(mpl, cayley, k, k) != ControlStatus::kOk) {
         return ControlStatus::kSingularCayley;
     }
-
-    Array<f64> cayley(k * k, sa);
-    (void)matmul(smi, k, k, spi_inv, k, cayley);
 
     if (!matsign(cayley, k, sa)) {
         return ControlStatus::kSignFailed;
@@ -232,7 +255,7 @@ ControlStatus dare(ArrayRef<f64> a, ArrayRef<f64> b, ArrayRef<f64> q, ArrayRef<f
         return ControlStatus::kSingularSubspace;
     }
 
-    if (!g_out.empty()) {
+    if (!g_out.empty() && m > 0) {
         Array<f64> xb(n * m, sa);
         Array<f64> bt_xb(m * m, sa);
         (void)matmul(x_out, n, n, b, m, xb);

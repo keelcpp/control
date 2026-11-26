@@ -2,20 +2,40 @@
 
 #include "keel/arena.h"
 #include "keel/array.h"
+#include "keel/linalg.h"
 #include "keel/math.h"
 
 namespace keel::control {
 
 namespace {
 
+inline bool is_finite_val(f64 v) noexcept { return keel::is_finite(v); }
+inline bool is_finite_val(c64 v) noexcept {
+    return keel::is_finite(v.real()) && keel::is_finite(v.imag());
+}
+
 template <typename T>
 ControlStatus solve_in_place_tpl(MutArrayRef<T> a, MutArrayRef<T> b, usize n, usize nrhs) noexcept {
-    if (a.size() < n * n || b.size() < n * nrhs) {
-        return ControlStatus::kInvalidArgument;
-    }
     if (n == 0) {
         return ControlStatus::kOk;
     }
+    if (a.size() / n < n || (nrhs > 0 && b.size() / n < nrhs)) {
+        return ControlStatus::kInvalidArgument;
+    }
+    const usize n2 = n * n;
+    f64 max_abs = 0.0;
+    for (usize i = 0; i < n2; ++i) {
+        if (!is_finite_val(a[i])) {
+            return ControlStatus::kSingular;
+        }
+        const f64 v = keel::abs(a[i]);
+        if (v > max_abs) max_abs = v;
+    }
+    if (max_abs == 0.0) {
+        return ControlStatus::kSingular;
+    }
+    const f64 piv_tol = 1e-14 * max_abs;
+
     for (usize k = 0; k < n; ++k) {
         usize pk = k;
         f64 best_abs = keel::abs(a[k * n + k]);
@@ -26,7 +46,7 @@ ControlStatus solve_in_place_tpl(MutArrayRef<T> a, MutArrayRef<T> b, usize n, us
                 pk = i;
             }
         }
-        if (best_abs < 1e-14) {
+        if (!keel::is_finite(best_abs) || best_abs <= piv_tol) {
             return ControlStatus::kSingular;
         }
         if (pk != k) {
@@ -64,7 +84,7 @@ ControlStatus solve_in_place_tpl(MutArrayRef<T> a, MutArrayRef<T> b, usize n, us
 template <typename T>
 ControlStatus matmul_tpl(ArrayRef<T> a, usize ra, usize ca, ArrayRef<T> b, usize cb,
                          MutArrayRef<T> c) noexcept {
-    if (a.size() < ra * ca || b.size() < ca * cb || c.size() < ra * cb) {
+    if ((ca > 0 && a.size() / ca < ra) || (cb > 0 && (b.size() / cb < ca || c.size() / cb < ra))) {
         return ControlStatus::kInvalidArgument;
     }
     const usize total = ra * cb;
@@ -80,18 +100,6 @@ ControlStatus matmul_tpl(ArrayRef<T> a, usize ra, usize ca, ArrayRef<T> b, usize
         }
     }
     return ControlStatus::kOk;
-}
-
-[[nodiscard]] f64 mat_inf_norm(ArrayRef<f64> a, usize n) noexcept {
-    f64 m = 0.0;
-    for (usize i = 0; i < n; ++i) {
-        f64 s = 0.0;
-        for (usize j = 0; j < n; ++j) {
-            s += keel::abs(a[j * n + i]);
-        }
-        if (s > m) m = s;
-    }
-    return m;
 }
 
 } // namespace
@@ -116,104 +124,43 @@ ControlStatus matmul_c64(ArrayRef<c64> a, usize ra, usize ca, ArrayRef<c64> b, u
 }
 
 ControlStatus expm(ArrayRef<f64> a_in, usize n, MutArrayRef<f64> out, Allocator* alloc) {
-    const usize n2 = n * n;
-    if (a_in.size() < n2 || out.size() < n2) {
-        return ControlStatus::kInvalidArgument;
-    }
     if (n == 0) {
         return ControlStatus::kOk;
     }
+    if (a_in.size() / n < n || out.size() / n < n) {
+        return ControlStatus::kInvalidArgument;
+    }
+    const usize n2 = n * n;
+    for (usize i = 0; i < n2; ++i) {
+        if (!keel::is_finite(a_in[i])) {
+            return ControlStatus::kInvalidArgument;
+        }
+    }
 
     ArenaTemp scratch = keel::get_scratch(alloc);
-    Array<f64> a(n2, scratch.allocator());
-    for (usize i = 0; i < n2; ++i) a[i] = a_in[i];
-
-    const f64 norm_a = mat_inf_norm(a, n);
-    i32 s = 0;
-    if (norm_a > 0.5) {
-        const f64 l2 = keel::log2(norm_a / 0.5);
-        s = as<i32>(keel::ceil(keel::max(l2, 0.0)));
+    Array<f64> res(n2, 0.0, scratch.allocator());
+    if (!keel::linalg::expm(a_in.data(), n, res.data(), scratch.allocator())) {
+        return ControlStatus::kSingular;
     }
-    if (s > 0) {
-        const f64 scale = keel::pow(0.5, as<f64>(s));
-        for (usize i = 0; i < n2; ++i) a[i] *= scale;
+    for (usize i = 0; i < n2; ++i) {
+        out[i] = res[i];
     }
-
-    constexpr f64 c[7] = {
-        1.0,
-        1.0 / 2.0,
-        5.0 / 44.0,
-        1.0 / 66.0,
-        1.0 / 792.0,
-        1.0 / 15840.0,
-        1.0 / 665280.0,
-    };
-
-    Array<f64> eye(n2, 0.0, scratch.allocator());
-    for (usize i = 0; i < n; ++i) eye[i * n + i] = 1.0;
-
-    Array<f64> a2(n2, scratch.allocator());
-    Array<f64> a3(n2, scratch.allocator());
-    Array<f64> a4(n2, scratch.allocator());
-    Array<f64> a5(n2, scratch.allocator());
-    Array<f64> a6(n2, scratch.allocator());
-
-    (void)matmul(a, n, n, a, n, a2);
-    (void)matmul(a2, n, n, a, n, a3);
-    (void)matmul(a2, n, n, a2, n, a4);
-    (void)matmul(a4, n, n, a, n, a5);
-    (void)matmul(a4, n, n, a2, n, a6);
-
-    Array<f64> num(n2, 0.0, scratch.allocator());
-    Array<f64> den(n2, 0.0, scratch.allocator());
-    auto axpy = [&](MutArrayRef<f64> dst, ArrayRef<f64> src, f64 alpha) noexcept {
-        for (usize i = 0; i < n2; ++i) dst[i] += alpha * src[i];
-    };
-    axpy(num, eye, c[0]); axpy(den, eye, c[0]);
-    axpy(num, a, c[1]);   axpy(den, a, -c[1]);
-    axpy(num, a2, c[2]);  axpy(den, a2, c[2]);
-    axpy(num, a3, c[3]);  axpy(den, a3, -c[3]);
-    axpy(num, a4, c[4]);  axpy(den, a4, c[4]);
-    axpy(num, a5, c[5]);  axpy(den, a5, -c[5]);
-    axpy(num, a6, c[6]);  axpy(den, a6, c[6]);
-
-    Array<f64> x = keel::move(num);
-    if (solve_in_place(den, x, n, n) != ControlStatus::kOk) {
-        Array<f64> e(n2, scratch.allocator());
-        Array<f64> term(n2, scratch.allocator());
-        Array<f64> next_term(n2, scratch.allocator());
-        for (usize i = 0; i < n2; ++i) {
-            e[i] = eye[i];
-            term[i] = eye[i];
-        }
-        for (i32 k = 1; k < 30; ++k) {
-            (void)matmul(term, n, n, a, n, next_term);
-            const f64 inv = 1.0 / as<f64>(k);
-            for (usize i = 0; i < n2; ++i) {
-                term[i] = next_term[i] * inv;
-                e[i] += term[i];
-            }
-        }
-        x = keel::move(e);
-    }
-
-    Array<f64> sq(n2, scratch.allocator());
-    for (i32 k = 0; k < s; ++k) {
-        (void)matmul(x, n, n, x, n, sq);
-        keel::swap(x, sq);
-    }
-    for (usize i = 0; i < n2; ++i) out[i] = x[i];
     return ControlStatus::kOk;
 }
 
 ControlStatus char_poly(ArrayRef<f64> a, usize n, MutArrayRef<f64> out, Allocator* alloc) {
-    const usize n2 = n * n;
-    if (a.size() < n2 || out.size() < n + 1) {
+    if (out.size() < n + 1 || (n > 0 && a.size() / n < n)) {
         return ControlStatus::kInvalidArgument;
     }
     out[0] = 1.0;
     if (n == 0) {
         return ControlStatus::kOk;
+    }
+    const usize n2 = n * n;
+    for (usize i = 0; i < n2; ++i) {
+        if (!keel::is_finite(a[i])) {
+            return ControlStatus::kInvalidArgument;
+        }
     }
 
     ArenaTemp scratch = keel::get_scratch(alloc);
@@ -235,11 +182,11 @@ ControlStatus char_poly(ArrayRef<f64> a, usize n, MutArrayRef<f64> out, Allocato
 
 ControlStatus ctrb(ArrayRef<f64> a, usize n, ArrayRef<f64> b, usize m, MutArrayRef<f64> out,
                    Allocator* alloc) {
-    if (a.size() < n * n || b.size() < n * m || out.size() < n * n * m) {
-        return ControlStatus::kInvalidArgument;
-    }
     if (n == 0 || m == 0) {
         return ControlStatus::kOk;
+    }
+    if (a.size() / n < n || b.size() / m < n || out.size() / n < n || (out.size() / n) / n < m) {
+        return ControlStatus::kInvalidArgument;
     }
     ArenaTemp scratch = keel::get_scratch(alloc);
     Array<f64> cur(n * m, scratch.allocator());
@@ -261,11 +208,11 @@ ControlStatus ctrb(ArrayRef<f64> a, usize n, ArrayRef<f64> b, usize m, MutArrayR
 
 ControlStatus obsv(ArrayRef<f64> a, usize n, ArrayRef<f64> c, usize p, MutArrayRef<f64> out,
                    Allocator* alloc) {
-    if (a.size() < n * n || c.size() < p * n || out.size() < (n * p) * n) {
-        return ControlStatus::kInvalidArgument;
-    }
     if (n == 0 || p == 0) {
         return ControlStatus::kOk;
+    }
+    if (a.size() / n < n || c.size() / n < p || out.size() / n < n || (out.size() / n) / n < p) {
+        return ControlStatus::kInvalidArgument;
     }
     const usize out_rows = n * p;
     ArenaTemp scratch = keel::get_scratch(alloc);
